@@ -1,6 +1,11 @@
 from pathlib import Path
 
-from langchain_core.messages import SystemMessage
+from langchain_core.messages import (
+    SystemMessage,
+    AIMessage,
+    HumanMessage,
+    ToolMessage,
+)
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
 
@@ -43,6 +48,138 @@ def load_workout_skill():
 
 
 WORKOUT_SKILL = load_workout_skill()
+
+
+# ==================================================
+# Grounding Guardrails
+# ==================================================
+
+def get_latest_user_message(
+    messages
+) -> str:
+    """
+    Return the most recent user message from
+    the current LangGraph conversation state.
+    """
+
+    for message in reversed(messages):
+
+        if isinstance(
+            message,
+            HumanMessage
+        ):
+            return str(
+                message.content
+            )
+
+        if isinstance(
+            message,
+            dict
+        ):
+            if (
+                message.get("role")
+                == "user"
+            ):
+                return str(
+                    message.get(
+                        "content",
+                        ""
+                    )
+                )
+
+    return ""
+
+
+def is_exact_personalized_dosage_request(
+    text: str
+) -> bool:
+    """
+    Detect requests for an exact personalized
+    dosage.
+
+    General dosage ranges are not sufficient
+    evidence for an exact individualized dosage.
+    """
+
+    text = text.lower()
+
+    dosage_terms = [
+        "מינון",
+        "dose",
+        "dosage",
+    ]
+
+    exact_terms = [
+        "מדויק",
+        "בדיוק",
+        "exact",
+        "exactly",
+        "specific",
+    ]
+
+    personal_terms = [
+        "אני",
+        "לי",
+        "עבורי",
+        "שלי",
+        "שאני צריך",
+        "שאני צריכה",
+        "אני צריך",
+        "אני צריכה",
+        "for me",
+        "should i",
+        "my dose",
+        "my dosage",
+        "i need",
+    ]
+
+    has_dosage = any(
+        term in text
+        for term in dosage_terms
+    )
+
+    has_exact = any(
+        term in text
+        for term in exact_terms
+    )
+
+    has_personal = any(
+        term in text
+        for term in personal_terms
+    )
+
+    return (
+        has_dosage
+        and has_exact
+        and has_personal
+    )
+
+
+def rag_search_was_used(
+    messages
+) -> bool:
+    """
+    Check whether the professional knowledge
+    RAG tool has already been executed.
+    """
+
+    for message in messages:
+
+        if isinstance(
+            message,
+            ToolMessage
+        ):
+            if (
+                getattr(
+                    message,
+                    "name",
+                    None
+                )
+                == "search_fitness_knowledge"
+            ):
+                return True
+
+    return False
 
 
 # ==================================================
@@ -101,6 +238,7 @@ Content:
 KNOWLEDGE_BASE_CONTEXT
 
 IMPORTANT:
+
 Use ONLY the professional information explicitly
 supported by the retrieved context below.
 
@@ -121,6 +259,17 @@ Do NOT invent:
 - Numerical guidelines
 
 unless they are supported by the retrieved context.
+
+IMPORTANT PERSONALIZATION RULE:
+
+A general dosage range, population-level dosage,
+commonly used dosage, example dosage or
+per-kilogram formula does NOT establish an exact
+personalized dosage for a specific individual.
+
+If the user asks for an exact personalized dosage,
+do not convert general retrieved information into
+an individualized prescription.
 
 RETRIEVED CONTEXT:
 
@@ -200,23 +349,64 @@ support the requested information:
 - Stop there.
 - Do not provide an answer from memory.
 - Do not guess.
-- Do not provide a "general recommendation".
+- Do not provide a general recommendation.
 - Do not provide commonly accepted values.
 - Do not provide unsupported numerical values.
+
+
+PERSONALIZED DOSAGE RULE:
+
+There is an important difference between:
+
+1. General information about dosage ranges.
+
+and
+
+2. An exact dosage that a specific individual
+   personally should take.
+
+A general dosage range, population-level
+recommendation, common dosage, example dosage,
+or per-kilogram formula is NOT enough evidence
+to determine an exact personalized dosage.
+
+If the user asks for an exact dosage that THEY
+personally should take:
+
+- You MUST first search the FitMate knowledge base.
+- General ranges do NOT qualify as sufficient
+  support for an individualized exact dosage.
+- Do NOT transform a general range into a
+  personalized recommendation.
+- Do NOT provide a dosage number.
+- Do NOT provide a dosage range.
+- Do NOT provide a commonly accepted dosage.
+- Clearly explain that the available knowledge
+  is insufficient to determine an exact
+  personalized dosage.
+
+For a Hebrew user, prefer wording such as:
+
+"המידע הקיים כרגע במאגר הידע של FitMate אינו
+מספיק כדי לתת מינון מדויק ומותאם אישית עבורך."
+
 
 Example:
 
 If the user asks for a creatine dosage and the
-retrieved knowledge does not contain a creatine
+retrieved knowledge does not contain enough
+information for the requested exact personalized
 dosage:
 
 GOOD:
+
 "המידע הקיים כרגע במאגר הידע של FitMate אינו
-מספיק כדי לתת מינון מדויק של קריאטין."
+מספיק כדי לתת מינון מדויק ומותאם אישית עבורך."
 
 BAD:
-"המאגר לא מכיל מידע, אבל בדרך כלל לוקחים
-3-5 גרם ביום."
+
+"המאגר לא מכיל מספיק מידע אישי, אבל בדרך כלל
+לוקחים 3-5 גרם ביום."
 
 The BAD behavior is forbidden.
 
@@ -358,7 +548,7 @@ WORKOUT PLANNING SKILL
 
 model = ChatOpenAI(
     model="gpt-4.1-mini",
-    temperature=0.2
+    temperature=0
 )
 
 model_with_tools = model.bind_tools(
@@ -374,11 +564,56 @@ def call_agent(
     state: MessagesState
 ):
 
+    state_messages = (
+        state["messages"]
+    )
+
+    latest_user_message = (
+        get_latest_user_message(
+            state_messages
+        )
+    )
+
+    # --------------------------------------------------
+    # Deterministic Grounding Guardrail
+    # --------------------------------------------------
+    #
+    # The RAG tool is still required and must run first.
+    #
+    # After retrieval, if the original user request asks
+    # for an exact personalized dosage, a general dosage
+    # range is NOT treated as enough evidence for an
+    # individualized recommendation.
+    #
+    # This prevents the model from turning generic
+    # retrieved ranges into a personalized prescription.
+    # --------------------------------------------------
+
+    if (
+        is_exact_personalized_dosage_request(
+            latest_user_message
+        )
+        and rag_search_was_used(
+            state_messages
+        )
+    ):
+        return {
+            "messages": [
+                AIMessage(
+                    content=(
+                        "המידע הקיים כרגע במאגר הידע "
+                        "של FitMate אינו מספיק כדי לתת "
+                        "מינון מדויק ומותאם אישית עבורך."
+                    )
+                )
+            ]
+        }
+
     messages = [
         SystemMessage(
             content=SYSTEM_PROMPT
         ),
-        *state["messages"]
+        *state_messages
     ]
 
     response = model_with_tools.invoke(

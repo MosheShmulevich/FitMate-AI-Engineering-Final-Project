@@ -1,3 +1,4 @@
+
 import uuid
 
 from agent import fitmate_agent
@@ -195,6 +196,9 @@ def eval_progress_memory():
             [
                 "bench press",
                 "לחיצת חזה",
+                "בנץ' פרס",
+                "בנץ׳ פרס",
+                "בנץ פרס",
             ]
         )
     )
@@ -446,3 +450,4 @@ def run_evals():
 
 if __name__ == "__main__":
     run_evals()
+
