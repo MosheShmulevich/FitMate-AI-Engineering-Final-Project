@@ -1,0 +1,9 @@
+streamlit
+openai
+python-dotenv
+langgraph
+langchain-openai
+pinecone
+pypdf
+pydantic
+rank-bm25
